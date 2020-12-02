@@ -137,6 +137,10 @@ export interface SAMLOptions {
   requestIdExpirationPeriodMs: number;
   audience: string;
   forceAuthn: boolean;
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  requestXmlbuilderOptions: object;
+  wantAssertionsSigned: boolean;
+  supportedIdentifierFormats: string[];
 }
 
 
@@ -215,6 +219,10 @@ class SAML {
     // sha1, sha256, or sha512
     if (!options.signatureAlgorithm) {
       options.signatureAlgorithm = 'sha1';
+    }
+
+    if (!options.requestXmlbuilderOptions) {
+      options.requestXmlbuilderOptions = {};
     }
 
     /**
@@ -399,7 +407,7 @@ class SAML {
         request['samlp:AuthnRequest']['samlp:Scoping'] = scoping;
       }
 
-      let stringRequest = xmlbuilder.create(request as unknown as Record<string, any>).end();
+      let stringRequest = xmlbuilder.create(request as unknown as Record<string, any>, this.options.requestXmlbuilderOptions).end();
       if (isHttpPostBinding && this.options.privateKey) {
         stringRequest = signAuthnRequestPost(stringRequest, this.options);
       }
@@ -448,9 +456,11 @@ class SAML {
       };
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const self = this;
     return util.promisify(this.cacheProvider.save).bind(this.cacheProvider)(id, instant)
       .then(function() {
-        return xmlbuilder.create(request as unknown as Record<string, any>).end();
+        return xmlbuilder.create(request as unknown as Record<string, any>, self.options.requestXmlbuilderOptions).end();
       });
   }
 
@@ -478,7 +488,7 @@ class SAML {
       }
     };
 
-    return xmlbuilder.create(request).end();
+    return xmlbuilder.create(request, this.options.requestXmlbuilderOptions).end();
   }
 
   requestToUrl(request: string | null | undefined, response: string | null, operation: string, additionalParameters: querystring.ParsedUrlQuery, callback: (err: Error | null, url?: string | null | undefined) => void) {
@@ -761,13 +771,14 @@ class SAML {
 
     (async() => {
       xml = Buffer.from(container.SAMLResponse, 'base64').toString('utf8');
+      xml = xml.replace(/\r\n?/g, '\n');
       doc = new xmldom.DOMParser({
       }).parseFromString(xml);
 
       if (!Object.prototype.hasOwnProperty.call(doc, 'documentElement'))
         throw new Error('SAMLResponse is not valid base64-encoded XML');
 
-      const inResponseToNodes = xmlCrypto.xpath(doc, "/*[local-name()='Response']/@InResponseTo") as Attr[];
+      const inResponseToNodes = xmlCrypto.xpath(doc, "/*[contains(local-name(),'Response')]/@InResponseTo") as Attr[];
 
       if (inResponseToNodes) {
         inResponseTo = inResponseToNodes.length ? inResponseToNodes[0].nodeValue : null;
@@ -811,6 +822,7 @@ class SAML {
         const xmlencOptions = { key: this.options.decryptionPvk };
         return util.promisify(xmlenc.decrypt).bind(xmlenc)(encryptedAssertionXml, xmlencOptions)
         .then((decryptedXml: string) => {
+          decryptedXml = decryptedXml.replace(/\r\n?/g, '\n');
           const decryptedDoc = new xmldom.DOMParser().parseFromString(decryptedXml);
           const decryptedAssertions = xmlCrypto.xpath(decryptedDoc, "/*[local-name()='Assertion']") as HTMLElement[];
           if (decryptedAssertions.length != 1)
@@ -930,7 +942,9 @@ class SAML {
         return callback(err);
       }
 
-      const dom = new xmldom.DOMParser().parseFromString(inflated.toString());
+      let xml = inflated.toString();
+      xml = xml.replace(/\r\n?/g, '\n');
+      const dom = new xmldom.DOMParser().parseFromString(xml);
       const parserConfig = {
         explicitRoot: true,
         explicitCharkey: true,
@@ -973,7 +987,7 @@ class SAML {
         .then(certs => {
           const hasValidQuerySignature = certs!.some(cert => {
             return this.validateSignatureForRedirect(
-              urlString, container.Signature as string, container.SigAlg as string, cert
+              urlString, container.Signature as string, container.SigAlg as string, this.certToPEM(cert)
             );
           });
 
@@ -1248,7 +1262,8 @@ class SAML {
       if (!restriction.Audience || !restriction.Audience[0] || !restriction.Audience[0]._) {
         return new Error('SAML assertion AudienceRestriction has no Audience value');
       }
-      if (restriction.Audience[0]._ !== expectedAudience) {
+      const matched = restriction.Audience.some(aud => aud._ && aud._ === expectedAudience);
+      if (!matched) {
         return new Error('SAML assertion audience mismatch');
       }
       return null;
@@ -1262,7 +1277,8 @@ class SAML {
   }
 
   validatePostRequest(container: Record<string, string>, callback: (err: Error | null, profile?: Profile, loggedOut?: boolean) => void) {
-    const xml = Buffer.from(container.SAMLRequest, 'base64').toString('utf8');
+    let xml = Buffer.from(container.SAMLRequest, 'base64').toString('utf8');
+    xml = xml.replace(/\r\n?/g, '\n');
     const dom = new xmldom.DOMParser().parseFromString(xml);
     const parserConfig = {
       explicitRoot: true,
@@ -1341,6 +1357,10 @@ class SAML {
       }
     };
 
+    if (this.options.wantAssertionsSigned) {
+      metadata.EntityDescriptor.SPSSODescriptor['@WantAssertionsSigned'] = 'true';
+    }
+
     if (this.options.decryptionPvk) {
       if (!decryptionCert) {
         throw new Error(
@@ -1406,7 +1426,11 @@ class SAML {
       };
     }
 
-    if (this.options.identifierFormat) {
+    if (this.options.supportedIdentifierFormats) {
+      const formats: XMLValue = [];
+      this.options.supportedIdentifierFormats.forEach(format => formats.push(format));
+      metadata.EntityDescriptor.SPSSODescriptor.NameIDFormat = formats;
+    } else if (this.options.identifierFormat) {
       metadata.EntityDescriptor.SPSSODescriptor.NameIDFormat = this.options.identifierFormat;
     }
 
